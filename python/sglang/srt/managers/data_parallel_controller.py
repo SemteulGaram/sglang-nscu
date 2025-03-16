@@ -69,6 +69,8 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            # set timeout to avoid blocking forever
+            self.recv_from_tokenizer.setsockopt(zmq.RCVTIMEO, 100)
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -209,7 +211,10 @@ class DataParallelController:
         while True:
             while True:
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = self.recv_from_tokenizer.recv_pyobj()
+                except zmq.Again:
+                    # skip if no more requests
+                    break
                 except zmq.ZMQError:
                     break
 

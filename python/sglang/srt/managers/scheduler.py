@@ -182,6 +182,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            self.recv_from_tokenizer.setsockopt(zmq.RCVTIMEO, 100)
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
@@ -554,7 +555,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
             while True:
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = self.recv_from_tokenizer.recv_pyobj()
+                except zmq.Again:
+                    # skip if no more requests
+                    break
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
