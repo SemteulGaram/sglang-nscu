@@ -70,7 +70,7 @@ class DataParallelController:
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
             # set timeout to avoid blocking forever
-            self.recv_from_tokenizer.setsockopt(zmq.RCVTIMEO, 100)
+            self.recv_from_tokenizer.setsockopt(zmq.RCVTIMEO, 1)
 
         # Dispatch method
         self.round_robin_counter = 0
