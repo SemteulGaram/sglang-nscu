@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer, root_validator
 from typing_extensions import Literal
 
 
@@ -28,6 +28,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    max_model_len: Optional[int] = None
 
 
 class ModelList(BaseModel):
@@ -181,14 +182,25 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    return_hidden_states: Optional[bool] = False
+
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
 
 
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Literal["stop", "length", "content_filter", "abort"]
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer
+    def _serialize(self):
+        return exclude_if_none(self, ["hidden_states"])
 
 
 class CompletionResponse(BaseModel):
@@ -204,8 +216,13 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer
+    def _serialize(self):
+        return exclude_if_none(self, ["hidden_states"])
 
 
 class CompletionStreamResponse(BaseModel):
@@ -227,20 +244,51 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+class ChatCompletionMessageContentAudioURL(BaseModel):
+    url: str
+
+
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+class ChatCompletionMessageContentAudioPart(BaseModel):
+    type: Literal["audio_url"]
+    audio_url: ChatCompletionMessageContentAudioURL
+
+
 ChatCompletionMessageContentPart = Union[
-    ChatCompletionMessageContentTextPart, ChatCompletionMessageContentImagePart
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentAudioPart,
 ]
+
+
+class FunctionResponse(BaseModel):
+    """Function response."""
+
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
+class ToolCall(BaseModel):
+    """Tool call response."""
+
+    id: Optional[str] = None
+    index: Optional[int] = None
+    type: Literal["function"] = "function"
+    function: FunctionResponse
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart]]
+    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -276,6 +324,7 @@ class Function(BaseModel):
     description: Optional[str] = Field(default=None, examples=[None])
     name: Optional[str] = None
     parameters: Optional[object] = None
+    strict: bool = False
 
 
 class Tool(BaseModel):
@@ -307,10 +356,19 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(
+        default=None,
+        deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
+        description="The maximum number of tokens that can be generated in the chat completion. ",
+    )
+    max_completion_tokens: Optional[int] = Field(
+        default=None,
+        description="The maximum number of completion tokens for a chat completion request, "
+        "including visible output tokens and reasoning tokens. Input tokens are not included. ",
+    )
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Union[ResponseFormat, StructuralTagResponseFormat] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
@@ -323,6 +381,15 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
 
+    @root_validator(pre=True)
+    def set_tool_choice_default(cls, values):
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
+        return values
+
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
     min_p: float = 0.0
@@ -333,26 +400,24 @@ class ChatCompletionRequest(BaseModel):
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+    chat_template_kwargs: Optional[Dict] = None
 
+    # The request id.
+    rid: Optional[str] = None
 
-class FunctionResponse(BaseModel):
-    """Function response."""
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
 
-    name: Optional[str] = None
-    arguments: Optional[str] = None
-
-
-class ToolCall(BaseModel):
-    """Tool call response."""
-
-    id: str
-    type: Literal["function"] = "function"
-    function: FunctionResponse
+    # Hidden States
+    return_hidden_states: Optional[bool] = False
 
 
 class ChatMessage(BaseModel):
@@ -366,8 +431,15 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: str
+    finish_reason: Literal[
+        "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+    ]
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer
+    def _serialize(self):
+        return exclude_if_none(self, ["hidden_states"])
 
 
 class ChatCompletionResponse(BaseModel):
@@ -384,13 +456,20 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    hidden_states: Optional[object] = None
+
+    @model_serializer
+    def _serialize(self):
+        return exclude_if_none(self, ["hidden_states"])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Optional[
+        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+    ] = None
     matched_stop: Union[None, int, str] = None
 
 
@@ -419,6 +498,9 @@ class EmbeddingRequest(BaseModel):
     dimensions: int = None
     user: Optional[str] = None
 
+    # The request id.
+    rid: Optional[str] = None
+
 
 class EmbeddingObject(BaseModel):
     embedding: List[float]
@@ -431,3 +513,32 @@ class EmbeddingResponse(BaseModel):
     model: str
     object: str = "list"
     usage: Optional[UsageInfo] = None
+
+
+class ScoringRequest(BaseModel):
+    query: Optional[Union[str, List[int]]] = (
+        None  # Query text or pre-tokenized token IDs
+    )
+    items: Optional[Union[str, List[str], List[List[int]]]] = (
+        None  # Item text(s) or pre-tokenized token IDs
+    )
+    label_token_ids: Optional[List[int]] = (
+        None  # Token IDs to compute probabilities for
+    )
+    apply_softmax: bool = False
+    item_first: bool = False
+    model: str
+
+
+class ScoringResponse(BaseModel):
+    scores: List[
+        List[float]
+    ]  # List of lists of probabilities, each in the order of label_token_ids
+    model: str
+    usage: Optional[UsageInfo] = None
+    object: str = "scoring"
+
+
+def exclude_if_none(obj, field_names: List[str]):
+    omit_if_none_fields = {k for k, v in obj.model_fields.items() if k in field_names}
+    return {k: v for k, v in obj if k not in omit_if_none_fields or v is not None}

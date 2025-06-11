@@ -14,15 +14,21 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
-import triton
+
+if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
+    import logging
+
+    torch._logging.set_logs(dynamo=logging.ERROR)
+    torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import get_bool_env_var, is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -99,8 +105,12 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
-        # Qwen2 models require higher flashinfer workspace size
-        if "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures:
+        # Qwen2/Qwen3 models require higher flashinfer workspace size
+        if (
+            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
+        ):
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
         # Allocate buffers
@@ -140,8 +150,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
+        fmha_backend = "auto"
+        if is_sm100_supported():
+            fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer, "NHD", backend=fmha_backend
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -264,6 +277,12 @@ class FlashInferAttnBackend(AttentionBackend):
             cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
         ]
 
+        # Ensure tensors are properly allocated
+        for i in range(self.num_wrappers):
+            # Force allocation by performing a small operation
+            if len(self.cuda_graph_kv_indices[i]) > 0:
+                self.cuda_graph_kv_indices[i][0] = 0
+
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_bs * self.max_context_len),
@@ -343,6 +362,35 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_draft_extend():
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend="fa2",
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    )
+                )
+
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=False,
+                encoder_lens=encoder_lens,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -367,6 +415,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_target_verify():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=False,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=spec_info,
+            )
+        elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -403,6 +462,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         logits_soft_cap = layer.logit_cap
 
+        q = q.contiguous()
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -412,7 +472,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
 
             o = prefill_wrapper_paged.forward(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
@@ -422,20 +482,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
             )
         else:
-            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
-
             if self.forward_metadata.extend_no_prefix:
-                o = o1
+                o = self.prefill_wrapper_ragged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+
             else:
+                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
@@ -476,6 +543,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -932,6 +1000,7 @@ class FlashInferMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
+        self.page_size = model_runner.page_size
 
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
@@ -985,9 +1054,9 @@ class FlashInferMultiStepDraftBackend:
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
-            triton.next_power_of_2(num_seqs),
-            triton.next_power_of_2(self.speculative_num_steps),
-            triton.next_power_of_2(bs),
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps),
+            next_power_of_2(bs),
         )
 
         assert forward_batch.spec_info is not None
@@ -1008,7 +1077,7 @@ class FlashInferMultiStepDraftBackend:
         global_override_indptr_cpu = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        kv_indices = torch.zeros(
+        kv_indices = torch.empty(
             (
                 self.speculative_num_steps,
                 forward_batch.batch_size * self.topk * self.max_context_len,
@@ -1018,8 +1087,6 @@ class FlashInferMultiStepDraftBackend:
         )
 
         def call_fn(i, forward_batch):
-            assert forward_batch.spec_info is not None
-            assert isinstance(forward_batch.spec_info, EagleDraftInput)
             forward_batch.spec_info.kv_indptr = (
                 forward_batch.spec_info.kv_indptr.clone()
             )
@@ -1139,8 +1206,9 @@ def fast_decode_plan(
     pos_encoding_mode: str = "NONE",
     window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
-    data_type: Union[str, torch.dtype] = "float16",
     q_data_type: Optional[Union[str, torch.dtype]] = None,
+    kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    data_type: Optional[Union[str, torch.dtype]] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -1155,6 +1223,18 @@ def fast_decode_plan(
     batch_size = len(last_page_len)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
+
+    # Handle data types consistently
+    if data_type is not None:
+        if q_data_type is None:
+            q_data_type = data_type
+        if kv_data_type is None:
+            kv_data_type = data_type
+    elif q_data_type is None:
+        q_data_type = "float16"
+
+    if kv_data_type is None:
+        kv_data_type = q_data_type
 
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
@@ -1171,36 +1251,33 @@ def fast_decode_plan(
             raise ValueError(
                 "The size of indices should be less than or equal to the allocated buffer"
             )
-        # Skip these copies because we directly write to them during prepartion
-        # self._paged_kv_indptr_buf.copy_(indptr)
-        # self._paged_kv_indices_buf[: len(indices)] = indices
-        # self._paged_kv_last_page_len_buf.copy_(last_page_len)
     else:
         self._paged_kv_indptr_buf = indptr
         self._paged_kv_indices_buf = indices
         self._paged_kv_last_page_len_buf = last_page_len
-        self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=non_blocking)
+        if self.use_tensor_cores:
+            self._qo_indptr_buf = qo_indptr_host.to(
+                self.device, non_blocking=non_blocking
+            )
 
-    # NOTE(Zihao): the following tensors acts as placeholder to pass dtype info
-    if not q_data_type:
-        q_data_type = data_type
+    # Create empty tensors for dtype info if needed
+    empty_q_data = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
+        ),
+        device=self.device,
+    )
 
-    if not hasattr(self, "empty_q_data"):
-        self.empty_q_data = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, q_data_type)
-                if isinstance(q_data_type, str)
-                else q_data_type
-            ),
-        )
-        self.empty_kv_cache = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, data_type) if isinstance(data_type, str) else data_type
-            ),
-        )
-        self.last_page_len = torch.ones(32768, dtype=torch.int32)
+    empty_kv_cache = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, kv_data_type)
+            if isinstance(kv_data_type, str)
+            else kv_data_type
+        ),
+        device=self.device,
+    )
 
     indptr_host = (
         global_override_indptr_cpu
@@ -1208,48 +1285,57 @@ def fast_decode_plan(
         else indptr.cpu()
     )
 
-    if self.use_tensor_cores:
-        kv_lens_arr_host = get_seq_lens(
-            indptr_host, self.last_page_len[:batch_size], page_size
-        )
+    with torch.cuda.device(self.device):
 
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_host,
-            indptr_host,
-            kv_lens_arr_host,
-            batch_size,  # total_num_rows
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-            head_dim,
-            head_dim,
-            False,  # causal
-            torch.cuda.current_stream().cuda_stream,
-        )
-    else:
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            indptr_host,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-            window_left,
-            logits_soft_cap,
-            head_dim,
-            head_dim,
-            self.empty_q_data,
-            self.empty_kv_cache,
-            torch.cuda.current_stream().cuda_stream,
-        )
+        if self.use_tensor_cores:
+            # ALSO convert last_page_len to CPU
+            last_page_len_host = last_page_len.cpu()
+
+            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+
+            try:
+                # Make sure we pass exactly 15 arguments for tensor core version
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    indptr_host,
+                    kv_lens_arr_host,
+                    batch_size,  # total_num_rows
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    head_dim,
+                    head_dim,
+                    False,  # causal
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in standard plan: {e}")
+        else:
+            try:
+                # Make sure we pass exactly 15 arguments for standard version
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    indptr_host,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    window_left,
+                    logits_soft_cap,
+                    head_dim,
+                    head_dim,
+                    empty_q_data,
+                    empty_kv_cache,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in standard plan: {e}")
 
     self._pos_encoding_mode = pos_encoding_mode
     self._window_left = window_left

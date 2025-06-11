@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.model_executor.cuda_graph_runner import (
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
+    model_capture_mode,
     set_global_graph_memory_pool,
     set_torch_compile_config,
 )
@@ -22,6 +24,10 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class EAGLEDraftCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
@@ -33,12 +39,12 @@ class EAGLEDraftCudaGraphRunner:
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.tp_size = self.model_runner.tp_size
-        self.dp_size = model_runner.server_args.dp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
         server_args = model_runner.server_args
-
-        assert self.disable_padding
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -51,6 +57,9 @@ class EAGLEDraftCudaGraphRunner:
         self.seq_len_fill_value = self.model_runner.draft_attn_backend.attn_backends[
             0
         ].get_cuda_graph_seq_len_fill_value()
+        self.seq_lens_cpu = torch.full(
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -69,22 +78,17 @@ class EAGLEDraftCudaGraphRunner:
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             self.hidden_states = torch.zeros(
-                (self.max_bs, self.model_runner.model_config.hidden_size),
+                (self.max_num_token, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
 
         # Capture
         try:
-            self.capture()
+            with model_capture_mode():
+                self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n"
-                "Possible solutions:\n"
-                "1. disable cuda graph by --disable-cuda-graph\n"
-                "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. specify --dtype to the same dtype (e.g. bfloat16)\n"
-                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def can_run(self, forward_batch: ForwardBatch):
@@ -113,9 +117,7 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = self.hidden_states[:num_seqs]
 
         spec_info = EagleDraftInput(
-            topk_p=topk_p,
-            topk_index=topk_index,
-            hidden_states=hidden_states,
+            topk_p=topk_p, topk_index=topk_index, hidden_states=hidden_states
         )
 
         # Forward batch
@@ -128,7 +130,7 @@ class EAGLEDraftCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum(),
+            seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -145,7 +147,7 @@ class EAGLEDraftCudaGraphRunner:
 
         # Run and capture
         def run_once():
-            # Backup two fileds, which will be modified in-place in `draft_forward`.
+            # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
@@ -169,6 +171,13 @@ class EAGLEDraftCudaGraphRunner:
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
+    def _postprocess_output_to_raw_bs(self, out, raw_bs):
+        score_list, token_list, parents_list = out
+        score_list = [x[:raw_bs] for x in score_list]
+        token_list = [x[:raw_bs] for x in token_list]
+        parents_list = [x[:raw_bs] for x in parents_list]
+        return (score_list, token_list, parents_list)
+
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         raw_bs = forward_batch.batch_size
@@ -180,6 +189,9 @@ class EAGLEDraftCudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(1)
             self.out_cache_loc.zero_()
+            self.positions.zero_()
+
+        num_tokens = bs * self.num_tokens_per_bs
 
         # Common inputs
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
@@ -193,11 +205,33 @@ class EAGLEDraftCudaGraphRunner:
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
 
         # Attention backend
+        if bs != raw_bs:
+            forward_batch.batch_size = bs
+            forward_batch.seq_lens = self.seq_lens[:bs]
+            forward_batch.req_pool_indices = self.req_pool_indices[:bs]
+            forward_batch.positions = self.positions[:num_tokens]
+
+        # Special handle for seq_len_cpu used when flashinfer mla is used
+        if forward_batch.seq_lens_cpu is not None and bs != raw_bs:
+            self.seq_lens_cpu.fill_(1)
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            forward_batch.seq_lens_cpu = self.seq_lens_cpu[:bs]
+
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            forward_batch, forward_batch.batch_size
+            forward_batch, bs
         )
 
         # Replay
         self.graphs[bs].replay()
+        out = self.output_buffers[bs]
 
-        return self.output_buffers[bs]
+        if bs != raw_bs:
+            out = self._postprocess_output_to_raw_bs(out, raw_bs)
+            forward_batch.batch_size = raw_bs
+            forward_batch.positions = self.positions[:raw_num_token]
+            forward_batch.seq_lens = self.seq_lens[:raw_bs]
+            forward_batch.req_pool_indices = self.req_pool_indices[:raw_bs]
+            if forward_batch.seq_lens_cpu is not None:
+                forward_batch.seq_lens_cpu = self.seq_lens_cpu[:raw_bs]
+
+        return out

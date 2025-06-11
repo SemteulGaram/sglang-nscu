@@ -1,7 +1,9 @@
 """
 python3 -m unittest test_openai_server.TestOpenAIServer.test_batch
 python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
-
+python3 -m unittest test_openai_server.TestOpenAIServer.test_completion_stream
+python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion
+python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion_stream
 """
 
 import json
@@ -9,7 +11,9 @@ import re
 import time
 import unittest
 
+import numpy as np
 import openai
+import requests
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
@@ -18,11 +22,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestOpenAIServer(unittest.TestCase):
+class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -135,27 +140,29 @@ class TestOpenAIServer(unittest.TestCase):
         for response in generator:
             usage = response.usage
             if usage is not None:
-                assert usage.prompt_tokens > 0
-                assert usage.completion_tokens > 0
-                assert usage.total_tokens > 0
+                assert usage.prompt_tokens > 0, f"usage.prompt_tokens was zero"
+                assert usage.completion_tokens > 0, f"usage.completion_tokens was zero"
+                assert usage.total_tokens > 0, f"usage.total_tokens was zero"
                 continue
 
             index = response.choices[0].index
             is_first = is_firsts.get(index, True)
 
             if logprobs:
-                assert response.choices[0].logprobs
-                assert isinstance(response.choices[0].logprobs.tokens[0], str)
+                assert response.choices[0].logprobs, f"no logprobs in response"
+                assert isinstance(
+                    response.choices[0].logprobs.tokens[0], str
+                ), f"{response.choices[0].logprobs.tokens[0]} is not a string"
                 if not (is_first and echo):
                     assert isinstance(
                         response.choices[0].logprobs.top_logprobs[0], dict
-                    )
+                    ), f"top_logprobs was not a dictionary"
                     ret_num_top_logprobs = len(
                         response.choices[0].logprobs.top_logprobs[0]
                     )
                     # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some output id maps to the same output token and duplicate in the map
                     # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
-                    assert ret_num_top_logprobs > 0
+                    assert ret_num_top_logprobs > 0, f"ret_num_top_logprobs was 0"
 
             if is_first:
                 if echo:
@@ -163,8 +170,8 @@ class TestOpenAIServer(unittest.TestCase):
                         prompt
                     ), f"{response.choices[0].text} and all args {echo} {logprobs} {token_input} {is_first}"
                 is_firsts[index] = False
-            assert response.id
-            assert response.created
+            assert response.id, f"no id in response"
+            assert response.created, f"no created in response"
 
         for index in [i for i in range(parallel_sample_num * num_choices)]:
             assert not is_firsts.get(
@@ -229,27 +236,29 @@ class TestOpenAIServer(unittest.TestCase):
         for response in generator:
             usage = response.usage
             if usage is not None:
-                assert usage.prompt_tokens > 0
-                assert usage.completion_tokens > 0
-                assert usage.total_tokens > 0
+                assert usage.prompt_tokens > 0, f"usage.prompt_tokens was zero"
+                assert usage.completion_tokens > 0, f"usage.completion_tokens was zero"
+                assert usage.total_tokens > 0, f"usage.total_tokens was zero"
                 continue
 
             index = response.choices[0].index
             data = response.choices[0].delta
 
             if is_firsts.get(index, True):
-                assert data.role == "assistant"
+                assert (
+                    data.role == "assistant"
+                ), f"data.role was not 'assistant' for first chunk"
                 is_firsts[index] = False
                 continue
 
             if logprobs:
-                assert response.choices[0].logprobs
+                assert response.choices[0].logprobs, f"logprobs was not returned"
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs[0].token, str
-                )
+                ), f"top_logprobs token was not a string"
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs, list
-                )
+                ), f"top_logprobs was not a list"
                 ret_num_top_logprobs = len(
                     response.choices[0].logprobs.content[0].top_logprobs
                 )
@@ -257,7 +266,12 @@ class TestOpenAIServer(unittest.TestCase):
                     ret_num_top_logprobs == logprobs
                 ), f"{ret_num_top_logprobs} vs {logprobs}"
 
-            assert isinstance(data.content, str)
+            assert (
+                isinstance(data.content, str)
+                or isinstance(data.reasoning_content, str)
+                or len(data.tool_calls) > 0
+                or response.choices[0].finish_reason
+            )
             assert response.id
             assert response.created
 
@@ -427,7 +441,7 @@ class TestOpenAIServer(unittest.TestCase):
                             )
 
     def test_completion_stream(self):
-        # parallel sampling adn list input are not supported in streaming mode
+        # parallel sampling and list input are not supported in streaming mode
         for echo in [False, True]:
             for logprobs in [None, 5]:
                 for use_list_input in [True, False]:
@@ -528,6 +542,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
                 },
             ],
             temperature=0,
+            extra_body={"continue_final_message": True},
         )
 
         assert (
@@ -536,12 +551,18 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .startswith('"name": "SmartHome Mini",')
         )
 
+    def test_model_list(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        models = list(client.models.list())
+        assert len(models) == 1
+        assert isinstance(getattr(models[0], "max_model_len", None), int)
+
 
 # -------------------------------------------------------------------------
 #    EBNF Test Class: TestOpenAIServerEBNF
 #    Launches the server with xgrammar, has only EBNF tests
 # -------------------------------------------------------------------------
-class TestOpenAIServerEBNF(unittest.TestCase):
+class TestOpenAIServerEBNF(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -586,7 +607,6 @@ class TestOpenAIServerEBNF(unittest.TestCase):
             extra_body={"ebnf": ebnf_grammar},
         )
         text = response.choices[0].message.content.strip()
-        print("EBNF test output:", repr(text))
         self.assertTrue(len(text) > 0, "Got empty text from EBNF generation")
         self.assertRegex(text, pattern, f"Text '{text}' doesn't match EBNF choices")
 
@@ -617,14 +637,13 @@ class TestOpenAIServerEBNF(unittest.TestCase):
             extra_body={"ebnf": ebnf_grammar},
         )
         text = response.choices[0].message.content.strip()
-        print("EBNF strict JSON test output:", repr(text))
         self.assertTrue(len(text) > 0, "Got empty text from EBNF strict JSON test")
         self.assertRegex(
             text, pattern, f"Text '{text}' not matching the EBNF strict JSON shape"
         )
 
 
-class TestOpenAIEmbedding(unittest.TestCase):
+class TestOpenAIEmbedding(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
@@ -662,6 +681,258 @@ class TestOpenAIEmbedding(unittest.TestCase):
         self.assertEqual(len(response.data), 2)
         self.assertTrue(len(response.data[0].embedding) > 0)
         self.assertTrue(len(response.data[1].embedding) > 0)
+
+    def test_empty_string_embedding(self):
+        """Test embedding an empty string."""
+
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        # Text embedding example with empty string
+        text = ""
+        # Expect a BadRequestError for empty input
+        with self.assertRaises(openai.BadRequestError) as cm:
+            client.embeddings.create(
+                model=self.model,
+                input=text,
+            )
+        # check the status code
+        self.assertEqual(cm.exception.status_code, 400)
+
+
+class TestOpenAIServerIgnoreEOS(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_ignore_eos(self):
+        """
+        Test that ignore_eos=True allows generation to continue beyond EOS token
+        and reach the max_tokens limit.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        max_tokens = 200
+
+        response_default = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Count from 1 to 20."},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            extra_body={"ignore_eos": False},
+        )
+
+        response_ignore_eos = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Count from 1 to 20."},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            extra_body={"ignore_eos": True},
+        )
+
+        default_tokens = len(
+            self.tokenizer.encode(response_default.choices[0].message.content)
+        )
+        ignore_eos_tokens = len(
+            self.tokenizer.encode(response_ignore_eos.choices[0].message.content)
+        )
+
+        # Check if ignore_eos resulted in more tokens or exactly max_tokens
+        # The ignore_eos response should either:
+        # 1. Have more tokens than the default response (if default stopped at EOS before max_tokens)
+        # 2. Have exactly max_tokens (if it reached the max_tokens limit)
+        self.assertTrue(
+            ignore_eos_tokens > default_tokens or ignore_eos_tokens >= max_tokens,
+            f"ignore_eos did not generate more tokens: {ignore_eos_tokens} vs {default_tokens}",
+        )
+
+        self.assertEqual(
+            response_ignore_eos.choices[0].finish_reason,
+            "length",
+            f"Expected finish_reason='length' for ignore_eos=True, got {response_ignore_eos.choices[0].finish_reason}",
+        )
+
+
+class TestOpenAIV1Score(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1/score"
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def run_score(
+        self, query, items, label_token_ids, apply_softmax=False, item_first=False
+    ):
+        response = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "query": query,
+                "items": items,
+                "label_token_ids": label_token_ids,
+                "apply_softmax": apply_softmax,
+                "item_first": item_first,
+            },
+        )
+        return response.json()
+
+    def test_score_text_input(self):
+        """Test scoring with text input"""
+        query = "The capital of France is"
+        items = ["Paris", "London", "Berlin"]
+
+        # Get valid token IDs from the tokenizer
+        label_token_ids = []
+        for item in items:
+            token_ids = self.tokenizer.encode(item, add_special_tokens=False)
+            if not token_ids:
+                self.fail(f"Failed to encode item: {item}")
+            label_token_ids.append(token_ids[0])
+
+        response = self.run_score(query, items, label_token_ids, apply_softmax=True)
+
+        # Handle error responses
+        if response.get("type") == "BadRequestError":
+            self.fail(f"Score request failed with error: {response['message']}")
+
+        # Verify response structure
+        self.assertIn("scores", response, "Response should have a 'scores' field")
+        self.assertIsInstance(response["scores"], list, "scores should be a list")
+        self.assertEqual(
+            len(response["scores"]),
+            len(items),
+            "Number of scores should match number of items",
+        )
+
+        # Each score should be a list of floats in the order of label_token_ids
+        for i, score_list in enumerate(response["scores"]):
+            self.assertIsInstance(score_list, list, f"Score {i} should be a list")
+            self.assertEqual(
+                len(score_list),
+                len(label_token_ids),
+                f"Score {i} length should match label_token_ids",
+            )
+            self.assertTrue(
+                all(isinstance(v, float) for v in score_list),
+                f"Score {i} values should be floats",
+            )
+            self.assertAlmostEqual(
+                sum(score_list),
+                1.0,
+                places=6,
+                msg=f"Score {i} probabilities should sum to 1",
+            )
+
+    def test_score_token_input(self):
+        """Test scoring with token IDs input"""
+        query = "The capital of France is"
+        items = ["Paris", "London", "Berlin"]
+
+        # Get valid token IDs
+        query_ids = self.tokenizer.encode(query, add_special_tokens=False)
+        item_ids = [
+            self.tokenizer.encode(item, add_special_tokens=False) for item in items
+        ]
+        label_token_ids = [
+            ids[0] for ids in item_ids if ids
+        ]  # Get first token ID of each item
+
+        response = self.run_score(
+            query_ids, item_ids, label_token_ids, apply_softmax=True
+        )
+
+        # Handle error responses
+        if response.get("type") == "BadRequestError":
+            self.fail(f"Score request failed with error: {response['message']}")
+
+        # Verify response structure
+        self.assertIn("scores", response, "Response should have a 'scores' field")
+        self.assertIsInstance(response["scores"], list, "scores should be a list")
+        self.assertEqual(
+            len(response["scores"]),
+            len(items),
+            "Number of scores should match number of items",
+        )
+
+        # Each score should be a list of floats in the order of label_token_ids
+        for i, score_list in enumerate(response["scores"]):
+            self.assertIsInstance(score_list, list, f"Score {i} should be a list")
+            self.assertEqual(
+                len(score_list),
+                len(label_token_ids),
+                f"Score {i} length should match label_token_ids",
+            )
+            self.assertTrue(
+                all(isinstance(v, float) for v in score_list),
+                f"Score {i} values should be floats",
+            )
+            self.assertAlmostEqual(
+                sum(score_list),
+                1.0,
+                places=6,
+                msg=f"Score {i} probabilities should sum to 1",
+            )
+
+    def test_score_error_handling(self):
+        """Test error handling for invalid inputs"""
+        query = "The capital of France is"
+        items = ["Paris", "London", "Berlin"]
+
+        # Test with invalid token ID
+        response = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "query": query,
+                "items": items,
+                "label_token_ids": [999999],  # Invalid token ID
+                "apply_softmax": True,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        error_response = response.json()
+        self.assertEqual(error_response["type"], "BadRequestError")
+        self.assertIn("Token ID 999999 is out of vocabulary", error_response["message"])
 
 
 if __name__ == "__main__":
